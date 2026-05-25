@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="summary">
+  <form method="get" class="filters">
+    <label>С <input type="date" name="from" value="{{ filters['from'] }}"></label>
+    <label>По <input type="date" name="to" value="{{ filters['to'] }}"></label>
+    <label>Категория
+      <select name="category">
+        <option value="">— все —</option>
+        {% for c in categories %}
+          <option value="{{ c }}" {% if filters['category']==c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Поиск <input type="text" name="q" value="{{ filters['q'] }}" placeholder="по описанию или примечанию"></label>
+    <button type="submit">Применить</button>
+    <a href="{{ url_for('index') }}" class="reset">Сбросить</a>
+  </form>
+
+  <div class="totals">
+    <div class="total total-spent">
+      <span class="label">Потрачено</span>
+      <span class="value">{{ '{:,.0f}'.format(total_spent).replace(',', ' ') }} ₸</span>
+    </div>
+    <div class="total total-received">
+      <span class="label">Получено</span>
+      <span class="value">{{ '{:,.0f}'.format(total_received).replace(',', ' ') }} ₸</span>
+    </div>
+    <div class="total total-net">
+      <span class="label">Чистый</span>
+      <span class="value">{{ '{:,.0f}'.format(total_received - total_spent).replace(',', ' ') }} ₸</span>
+    </div>
+  </div>
+
+  <table class="cats-table">
+    <thead><tr><th>Категория</th><th>Расход</th><th>Доход</th><th>Кол-во</th></tr></thead>
+    <tbody>
+      {% for row in totals %}
+      <tr>
+        <td>
+          <a href="{{ url_for('index', category=row['category'], from=filters['from'], to=filters['to']) }}">
+            {{ row['category'] }}
+          </a>
+        </td>
+        <td class="num">{{ '{:,.0f}'.format(row['spent'] or 0).replace(',', ' ') }} ₸</td>
+        <td class="num">{{ '{:,.0f}'.format(row['received'] or 0).replace(',', ' ') }} ₸</td>
+        <td class="num">{{ row['n'] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="transactions">
+  <h2>Транзакции ({{ transactions|length }})</h2>
+  {% if not transactions %}
+    <p class="empty">Пока ничего нет. Загрузите PDF выписку из Kaspi сверху.</p>
+  {% endif %}
+  {% for tx in transactions %}
+    <details class="tx {% if tx['amount'] < 0 %}tx-out{% else %}tx-in{% endif %} {% if tx['user_edited'] %}tx-edited{% endif %}">
+      <summary>
+        <span class="tx-date">{{ tx['date'] }}</span>
+        <span class="tx-amount">
+          {% if tx['amount'] < 0 %}−{% else %}+{% endif %}{{ '{:,.0f}'.format(tx['amount']|abs).replace(',', ' ') }} ₸
+        </span>
+        <span class="tx-category">{{ tx['category'] }}</span>
+        <span class="tx-desc">{{ tx['description'] or tx['tx_type'] }}</span>
+        {% if tx['note'] %}<span class="tx-note">📝 {{ tx['note'] }}</span>{% endif %}
+      </summary>
+      <form action="{{ url_for('update_tx', tx_id=tx['id']) }}" method="post" class="tx-edit">
+        <label>Категория
+          <select name="category">
+            {% for c in categories %}
+              <option value="{{ c }}" {% if c==tx['category'] %}selected{% endif %}>{{ c }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Примечание
+          <input type="text" name="note" value="{{ tx['note'] }}" placeholder="Например: вернул долг Айдару">
+        </label>
+        <label class="remember">
+          <input type="checkbox" name="remember">
+          запомнить правило для подстроки:
+          <input type="text" name="remember_pattern" placeholder="например: айгерим" value="{{ tx['description'] }}">
+        </label>
+        <div class="actions">
+          <button type="submit">Сохранить</button>
+          <button type="submit" formaction="{{ url_for('delete_tx', tx_id=tx['id']) }}" class="danger"
+                  onclick="return confirm('Удалить транзакцию?')">Удалить</button>
+        </div>
+      </form>
+    </details>
+  {% endfor %}
+</section>
+
+{% endblock %}
