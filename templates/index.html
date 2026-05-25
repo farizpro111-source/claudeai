@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Kaspi · Анализ расходов</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Kaspi Анализ</h1>
+    <form class="upload" method="POST" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+      <label class="file-input">
+        <input type="file" name="pdf" accept="application/pdf" required>
+        <span>Выбрать PDF выписку</span>
+      </label>
+      <button type="submit">Загрузить</button>
+    </form>
+    <form method="POST" action="{{ url_for('reset') }}" onsubmit="return confirm('Удалить все транзакции?')">
+      <button type="submit" class="danger" title="Очистить базу">Сброс</button>
+    </form>
+    <a class="export" href="{{ url_for('export_csv') }}">Экспорт CSV</a>
+  </header>
+
+  {% if request.args.get('imported') %}
+  <div class="flash">
+    Распознано: {{ request.args.get('parsed') }}, добавлено новых: {{ request.args.get('imported') }}
+  </div>
+  {% endif %}
+
+  <section class="totals">
+    <div class="tile income">
+      <div class="label">Поступления</div>
+      <div class="value">+{{ '{:,.0f}'.format(total_in).replace(',', ' ') }} ₸</div>
+    </div>
+    <div class="tile expense">
+      <div class="label">Расходы</div>
+      <div class="value">−{{ '{:,.0f}'.format(total_out).replace(',', ' ') }} ₸</div>
+    </div>
+    <div class="tile net {{ 'positive' if net >= 0 else 'negative' }}">
+      <div class="label">Сальдо</div>
+      <div class="value">
+        {% if net >= 0 %}+{% else %}−{% endif %}{{ '{:,.0f}'.format(net|abs).replace(',', ' ') }} ₸
+      </div>
+    </div>
+  </section>
+
+  <section class="filters">
+    <form method="GET" action="{{ url_for('index') }}">
+      <input type="search" name="q" placeholder="Поиск по описанию / примечанию" value="{{ search }}">
+      <select name="category">
+        <option value="">Все категории</option>
+        {% for c in categories %}
+          <option value="{{ c }}" {% if c == category_filter %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+      <select name="direction">
+        <option value="" {% if not direction %}selected{% endif %}>Все операции</option>
+        <option value="out" {% if direction == 'out' %}selected{% endif %}>Только расходы</option>
+        <option value="in" {% if direction == 'in' %}selected{% endif %}>Только поступления</option>
+      </select>
+      <button type="submit">Применить</button>
+      {% if category_filter or direction or search %}
+        <a class="clear" href="{{ url_for('index') }}">сбросить</a>
+      {% endif %}
+    </form>
+  </section>
+
+  <div class="grid">
+    <aside class="summary">
+      <h2>По категориям</h2>
+      {% if summary %}
+        <ul>
+          {% for s in summary %}
+            <li>
+              <a href="{{ url_for('index', category=s.category, direction=direction, q=search) }}">
+                <span class="cat">{{ s.category }}</span>
+                <span class="amounts">
+                  {% if s.out %}<span class="out">−{{ '{:,.0f}'.format(s.out).replace(',', ' ') }}</span>{% endif %}
+                  {% if s.in %}<span class="in">+{{ '{:,.0f}'.format(s['in']).replace(',', ' ') }}</span>{% endif %}
+                </span>
+                <span class="count">{{ s.n }}</span>
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">Загрузите PDF, чтобы увидеть статистику.</p>
+      {% endif %}
+    </aside>
+
+    <main class="txns">
+      <h2>Транзакции ({{ rows|length }})</h2>
+      {% if not rows %}
+        <p class="empty big">
+          Здесь пока пусто.<br>
+          Загрузите PDF-выписку из приложения Kaspi.kz<br>
+          <small>(Главная → История → ⋯ → Выписка → PDF)</small>
+        </p>
+      {% else %}
+      <table>
+        <thead>
+          <tr>
+            <th>Дата</th>
+            <th class="right">Сумма</th>
+            <th>Операция / детали</th>
+            <th>Категория</th>
+            <th>Примечание</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr data-id="{{ r['id'] }}" class="{% if r['amount'] >= 0 %}income-row{% else %}expense-row{% endif %}">
+            <td class="date">{{ r['date'] }}</td>
+            <td class="right amount">
+              {% if r['amount'] >= 0 %}+{% endif %}{{ '{:,.2f}'.format(r['amount']).replace(',', ' ') }}
+            </td>
+            <td class="detail">
+              <div class="op">{{ r['operation'] }}</div>
+              <div class="det">{{ r['details'] }}</div>
+            </td>
+            <td>
+              <select class="cat-select">
+                {% set effective = r['user_category'] or r['auto_category'] %}
+                {% for c in categories %}
+                  <option value="{{ c }}" {% if c == effective %}selected{% endif %}>{{ c }}</option>
+                {% endfor %}
+              </select>
+              {% if not r['user_category'] %}<span class="auto-tag" title="Автоматически">авто</span>{% endif %}
+            </td>
+            <td>
+              <input class="note-input" type="text" placeholder="например: долг Айдару"
+                     value="{{ r['note'] or '' }}">
+            </td>
+            <td>
+              <button class="del" title="Удалить">×</button>
+              <span class="saved-mark"></span>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </main>
+  </div>
+
+  <script>
+    function debounce(fn, ms) {
+      let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+    }
+
+    async function saveRow(tr) {
+      const id = tr.dataset.id;
+      const category = tr.querySelector('.cat-select').value;
+      const note = tr.querySelector('.note-input').value;
+      const fd = new FormData();
+      fd.append('category', category);
+      fd.append('note', note);
+      const r = await fetch(`/txn/${id}`, { method: 'POST', body: fd });
+      const data = await r.json();
+      const mark = tr.querySelector('.saved-mark');
+      if (data.ok) {
+        mark.textContent = '✓';
+        mark.classList.add('ok');
+        const tag = tr.querySelector('.auto-tag');
+        if (tag) tag.remove();
+        setTimeout(() => { mark.textContent = ''; mark.classList.remove('ok'); }, 1200);
+      } else {
+        mark.textContent = '×';
+        mark.classList.add('err');
+      }
+    }
+
+    document.querySelectorAll('tr[data-id]').forEach(tr => {
+      tr.querySelector('.cat-select').addEventListener('change', () => saveRow(tr));
+      tr.querySelector('.note-input').addEventListener('input', debounce(() => saveRow(tr), 500));
+      tr.querySelector('.del').addEventListener('click', async () => {
+        if (!confirm('Удалить эту транзакцию?')) return;
+        const r = await fetch(`/txn/${tr.dataset.id}/delete`, { method: 'POST' });
+        if ((await r.json()).ok) tr.remove();
+      });
+    });
+  </script>
+</body>
+</html>
