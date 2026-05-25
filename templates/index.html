@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Excel-помощник</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Excel-помощник</h1>
+    <button id="reset-btn" type="button" title="Очистить диалог и контейнер">Новый диалог</button>
+  </header>
+
+  <main id="chat"></main>
+
+  <form id="composer" autocomplete="off">
+    <label class="file-pick" title="Прикрепить Excel-файл">
+      <input type="file" id="file-input" accept=".xlsx,.xls,.csv" />
+      <span id="file-label">+ Файл</span>
+    </label>
+    <textarea
+      id="message"
+      placeholder="Опишите задачу: например, «сделай сводную по столбцу 'Регион' с суммой 'Выручка'»"
+      rows="2"
+    ></textarea>
+    <button type="submit" id="send-btn">Отправить</button>
+  </form>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
