@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -24,7 +25,7 @@ from parser import parse_kaspi_pdf
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "kaspi-local-dev")
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 МБ хватит любой выписке
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 
 
 @app.before_request
@@ -32,9 +33,19 @@ def _ensure_db():
     db.init_db()
 
 
+def _all_categories() -> list[str]:
+    """Базовые + пользовательские (из БД). Без дубликатов, в одном списке."""
+    extras = db.list_user_categories()
+    seen = set()
+    result = []
+    for name in list(CATEGORIES) + extras:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
 def _pick_category(tx) -> str:
-    """Сначала смотрим в выученные правила (что юзер уже размечал),
-    потом — статические правила из categories.py, потом — дефолт по типу."""
     learned = db.learned_category(tx.description)
     if learned:
         return learned
@@ -59,13 +70,27 @@ def index():
     total_spent = sum(r["spent"] or 0 for r in totals)
     total_received = sum(r["received"] or 0 for r in totals)
 
+    # Данные для круговых графиков (Chart.js)
+    spent_chart = [
+        {"category": r["category"], "value": round(r["spent"] or 0, 2)}
+        for r in totals if (r["spent"] or 0) > 0
+    ]
+    received_chart = [
+        {"category": r["category"], "value": round(r["received"] or 0, 2)}
+        for r in totals if (r["received"] or 0) > 0
+    ]
+
     return render_template(
         "index.html",
         transactions=rows,
         totals=totals,
         total_spent=total_spent,
         total_received=total_received,
-        categories=CATEGORIES,
+        categories=_all_categories(),
+        rules=db.list_merchant_rules(),
+        user_categories=db.list_user_categories(),
+        spent_chart_json=json.dumps(spent_chart, ensure_ascii=False),
+        received_chart_json=json.dumps(received_chart, ensure_ascii=False),
         filters={"category": category or "", "from": date_from or "",
                  "to": date_to or "", "q": search or ""},
     )
@@ -125,17 +150,19 @@ def update_tx(tx_id: int):
     remember = request.form.get("remember") == "on"
     pattern = request.form.get("remember_pattern", "").strip()
 
-    if category not in CATEGORIES:
-        # позволим пользователю добавить новую категорию налету через примечание
-        CATEGORIES.append(category)
+    valid = set(_all_categories())
+    if category not in valid:
+        # На случай, если категорию удалили в параллельной вкладке.
+        category = "Прочее"
 
     db.update_transaction(tx_id, category, note)
 
     if remember and pattern:
-        db.upsert_merchant_rule(pattern, category)
+        updated = db.upsert_merchant_rule(pattern, category)
         flash(
-            f"Запомнил: «{pattern}» → {category}. Будущие такие транзакции "
-            f"попадут в эту категорию автоматически.",
+            f"Правило сохранено: «{pattern}» → {category}. "
+            f"Применено к {updated} другим транзакциям, "
+            f"и ко всем будущим загрузкам.",
             "success",
         )
 
@@ -149,9 +176,35 @@ def delete_tx(tx_id: int):
     return redirect(request.referrer or url_for("index"))
 
 
+@app.route("/categories/add", methods=["POST"])
+def add_category():
+    name = request.form.get("name", "").strip()
+    if not name:
+        flash("Введите название категории", "error")
+        return redirect(request.referrer or url_for("index"))
+    if db.add_user_category(name):
+        flash(f"Категория «{name}» добавлена", "success")
+    else:
+        flash(f"Категория «{name}» уже существует", "error")
+    return redirect(request.referrer or url_for("index"))
+
+
+@app.route("/categories/<string:name>/delete", methods=["POST"])
+def delete_category(name: str):
+    db.delete_user_category(name)
+    flash(f"Категория «{name}» удалена (транзакции переведены в «Прочее»)", "success")
+    return redirect(request.referrer or url_for("index"))
+
+
+@app.route("/rules/<int:rule_id>/delete", methods=["POST"])
+def delete_rule(rule_id: int):
+    db.delete_merchant_rule(rule_id)
+    flash("Правило удалено", "success")
+    return redirect(request.referrer or url_for("index"))
+
+
 @app.route("/api/totals")
 def api_totals():
-    """JSON со сводкой по категориям — на случай если захотите делать графики."""
     date_from = request.args.get("from") or None
     date_to = request.args.get("to") or None
     rows = db.category_totals(date_from=date_from, date_to=date_to)

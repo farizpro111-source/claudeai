@@ -73,6 +73,60 @@ main { padding: 24px; max-width: 1100px; margin: 0 auto; }
 .total-spent .value { color: var(--red); }
 .total-received .value { color: var(--green); }
 
+.charts {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;
+}
+.chart-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px;
+}
+.chart-card h3 { margin: 0 0 10px; font-size: 14px; color: var(--muted); }
+.chart-card canvas { max-height: 280px; }
+@media (max-width: 800px) {
+  .charts { grid-template-columns: 1fr; }
+}
+
+.settings {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; padding: 0 14px; margin-bottom: 24px;
+}
+.settings > details > summary {
+  list-style: none; cursor: pointer; padding: 14px 0;
+  font-weight: 600;
+}
+.settings > details > summary::-webkit-details-marker { display: none; }
+.settings-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+  padding: 0 0 16px;
+}
+.settings-grid h3 { margin: 0 0 8px; font-size: 14px; }
+.settings-grid h4 { margin: 14px 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; }
+.add-cat-form { display: flex; gap: 8px; }
+.add-cat-form input {
+  flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+}
+.chip-list { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #f0f2fb; padding: 4px 4px 4px 10px; border-radius: 16px;
+  font-size: 12px;
+}
+.chip form { display: inline; }
+.chip-del {
+  background: transparent; color: var(--muted); padding: 0 6px;
+  font-size: 16px; line-height: 1; border-radius: 50%; font-weight: 700;
+}
+.chip-del:hover { background: var(--red); color: #fff; }
+.rules-table { width: 100%; border-collapse: collapse; }
+.rules-table th, .rules-table td {
+  padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; text-align: left;
+}
+.rules-table th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+.rules-table code { background: #f6f7fb; padding: 2px 6px; border-radius: 4px; }
+button.small { padding: 4px 10px; font-size: 12px; }
+.muted { color: var(--muted); font-size: 13px; }
+@media (max-width: 800px) { .settings-grid { grid-template-columns: 1fr; } }
+
 .cats-table {
   width: 100%; background: var(--panel); border-collapse: collapse;
   border-radius: 12px; overflow: hidden; border: 1px solid var(--border);

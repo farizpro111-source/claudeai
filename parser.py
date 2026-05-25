@@ -1,11 +1,14 @@
 """Парсер PDF выписки Kaspi Bank.
 
-Kaspi отдаёт выписку в виде PDF с табличной структурой. Формат не зафиксирован
-официально, поэтому парсер устойчиво работает по тексту: ищем строки, начинающиеся
-с даты, и достаём из них дату, сумму (со знаком), тип операции и описание.
+Формат строки транзакции у Kaspi:
+    DD.MM.YY  - 2 420,00 ₸  Покупка YANDEX.GO
+    DD.MM.YY  + 15 500,00 ₸ Пополнение Султанмурат К.
+    DD.MM.YY  - 4 757,44 ₸ Покупка hostinger.com
+                            (- 9,99 USD)          <-- продолжение, без даты
 
-Если у вас PDF в немного другом формате — поправьте регексы тут, всё остальное
-приложение от этого не зависит.
+В выписке также есть служебные строки (остатки, итоги по категориям, заголовки),
+которые тоже содержат дату и сумму — их надо отсеять, иначе они попадают
+в список как «приходы».
 """
 
 from __future__ import annotations
@@ -14,38 +17,63 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
 
 import pdfplumber
 
 
-DATE_RE = re.compile(r"\b(\d{2}\.\d{2}\.\d{2,4})\b")
-# Сумма Kaspi: "- 1 500,00 ₸" / "+5 000,00 ₸" / "1500.00 KZT". Принимаем разные варианты.
+# Дата в формате DD.MM.YY или DD.MM.YYYY в начале строки.
+DATE_RE = re.compile(r"^\s*(\d{2}\.\d{2}\.\d{2,4})\b")
+# Сумма Kaspi: "- 1 500,00 ₸", "+5 000,00 ₸", "1500.00 KZT".
 AMOUNT_RE = re.compile(
-    r"([+\-−–]?\s?\d[\d\s ]*(?:[.,]\d{2})?)\s?(?:₸|тг|KZT|тенге)",
+    r"([+\-−–]?\s?\d[\d\s ]*(?:[.,]\d{2})?)\s?(?:₸|тг|KZT|тенге)",
     re.IGNORECASE,
 )
-# Известные типы операций Kaspi, какими они встречаются в PDF.
-TYPE_KEYWORDS = [
+
+# Эти ключевые слова означают, что строка — реальная транзакция.
+# Если ни одно не встретилось, строку игнорируем (это служебный остаток/итог).
+TX_TYPES = [
     "Покупка", "Перевод", "Пополнение", "Снятие", "Возврат",
     "Платёж", "Платеж", "Оплата", "Списание", "Зачисление",
+]
+
+# Подстроки, при которых строку точно нужно пропустить, даже если в ней
+# есть дата и сумма (это сводки, остатки, заголовки страниц и т.п.).
+SKIP_LINE_MARKERS = [
+    "Доступно на",
+    "Остаток",
+    "Итого",
+    "Лимит",
+    "Краткое содержание",
+    "Эквивалент",
+    "Сумма на счете",
+    "Валюта счета",
+    "ВЫПИСКА",
+    "Приложение к Справке",
+    "СПРАВКА",
+    "Номер счета",
+    "Номер карты",
+    # Футеры/заголовки страниц.
+    "Kaspi Bank",
+    "www.kaspi.kz",
+    "БИК CASPKZKA",
+    "содержит информацию об операциях",
+    "между счетами",
+    "Раздел",
 ]
 
 
 @dataclass
 class Transaction:
-    """Одна транзакция, готовая к вставке в БД."""
     date: str           # ISO YYYY-MM-DD
-    raw_date: str       # как было в PDF
-    tx_type: str        # "Покупка", "Перевод", ...
+    raw_date: str
+    tx_type: str        # один из TX_TYPES
     amount: float       # отрицательная — расход, положительная — приход
-    description: str    # получатель / комментарий
-    fingerprint: str    # стабильный хэш, чтобы не дублировать при повторной загрузке
+    description: str
+    fingerprint: str
 
 
 def _parse_amount(raw: str) -> float | None:
-    """'- 1 500,00' -> -1500.0. Возвращает None, если не разобрать."""
-    s = raw.replace(" ", " ").replace(" ", "")
+    s = raw.replace(" ", " ").replace(" ", "")
     s = s.replace("−", "-").replace("–", "-")
     s = s.replace(",", ".")
     try:
@@ -63,21 +91,35 @@ def _parse_date(raw: str) -> str | None:
     return None
 
 
-def _detect_type(line: str) -> str:
-    for kw in TYPE_KEYWORDS:
-        if kw.lower() in line.lower():
+def _detect_type(line: str) -> str | None:
+    """Ищем точное слово (тип операции). Если ничего не нашли — None,
+    значит это не транзакционная строка, её надо пропустить."""
+    for kw in TX_TYPES:
+        # \b в середине слова в русском работает плохо, поэтому ищем подстроку
+        # с пробелом/началом/концом по краям.
+        if re.search(rf"(?:^|\s){re.escape(kw)}(?:\s|$)", line, re.IGNORECASE):
             return kw
-    return "Операция"
+    return None
 
 
-def _fingerprint(date: str, amount: float, description: str) -> str:
+def _should_skip(line: str) -> bool:
+    for marker in SKIP_LINE_MARKERS:
+        if marker.lower() in line.lower():
+            return True
+    return False
+
+
+def _fingerprint(date: str, amount: float, description: str, idx: int) -> str:
+    """Хэш для дедупликации. Включает индекс строки, потому что Kaspi
+    спокойно содержит несколько одинаковых переводов в один день."""
     h = hashlib.sha1()
-    h.update(f"{date}|{amount:.2f}|{description.strip().lower()}".encode("utf-8"))
+    h.update(
+        f"{date}|{amount:.2f}|{description.strip().lower()}|{idx}".encode("utf-8")
+    )
     return h.hexdigest()
 
 
 def _extract_text_lines(pdf_path: str) -> list[str]:
-    """Достаёт все строки из PDF. Использует pdfplumber, чтобы сохранить порядок."""
     lines: list[str] = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -90,44 +132,42 @@ def _extract_text_lines(pdf_path: str) -> list[str]:
 
 
 def parse_kaspi_pdf(pdf_path: str) -> list[Transaction]:
-    """Главная функция: возвращает список транзакций из PDF.
-
-    Алгоритм: идём по строкам, на каждой строке с датой и суммой собираем
-    транзакцию. Описание = всё остальное, очищенное от даты/суммы/типа.
-    """
     transactions: list[Transaction] = []
     lines = _extract_text_lines(pdf_path)
 
-    # Часто описание переноситcя на следующую строку. Склеиваем строку без даты
-    # с предыдущей строкой-транзакцией.
-    buffer: list[str] = []
+    idx = 0
     for line in lines:
-        if DATE_RE.search(line) and AMOUNT_RE.search(line):
-            if buffer:
-                # дополним описание предыдущей транзакции
-                if transactions:
-                    transactions[-1].description = (
-                        transactions[-1].description + " " + " ".join(buffer)
-                    ).strip()
-                buffer = []
+        date_m = DATE_RE.search(line)
+        amount_m = AMOUNT_RE.search(line)
 
-            date_match = DATE_RE.search(line)
-            amount_match = AMOUNT_RE.search(line)
-            raw_date = date_match.group(1)
+        is_transaction_line = (
+            date_m is not None
+            and amount_m is not None
+            and not _should_skip(line)
+            and _detect_type(line) is not None
+        )
+
+        if is_transaction_line:
+            raw_date = date_m.group(1)
             iso_date = _parse_date(raw_date)
             if not iso_date:
                 continue
-            amount = _parse_amount(amount_match.group(1))
+            amount = _parse_amount(amount_m.group(1))
             if amount is None:
                 continue
-            tx_type = _detect_type(line)
+            tx_type = _detect_type(line) or "Операция"
 
             description = line
             description = DATE_RE.sub("", description, count=1)
             description = AMOUNT_RE.sub("", description, count=1)
-            for kw in TYPE_KEYWORDS:
-                description = re.sub(re.escape(kw), "", description, count=1, flags=re.IGNORECASE)
-            description = re.sub(r"\s+", " ", description).strip(" -–—•|")
+            description = re.sub(
+                rf"(?:^|\s){re.escape(tx_type)}(?:\s|$)",
+                " ",
+                description,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+            description = re.sub(r"\s+", " ", description).strip(" -–—•|:")
 
             tx = Transaction(
                 date=iso_date,
@@ -135,24 +175,23 @@ def parse_kaspi_pdf(pdf_path: str) -> list[Transaction]:
                 tx_type=tx_type,
                 amount=amount,
                 description=description,
-                fingerprint=_fingerprint(iso_date, amount, description),
+                fingerprint=_fingerprint(iso_date, amount, description, idx),
             )
             transactions.append(tx)
+            idx += 1
         else:
-            # строка без даты — возможно продолжение описания
-            if transactions and not DATE_RE.search(line):
-                buffer.append(line)
-
-    # сольём хвостовой буфер в последнюю транзакцию
-    if buffer and transactions:
-        transactions[-1].description = (
-            transactions[-1].description + " " + " ".join(buffer)
-        ).strip()
-        # пересчёт fingerprint, т.к. описание изменилось
-        transactions[-1].fingerprint = _fingerprint(
-            transactions[-1].date,
-            transactions[-1].amount,
-            transactions[-1].description,
-        )
+            # Строка без даты/типа — возможно, это продолжение описания
+            # предыдущей транзакции (например, "(- 9,99 USD)" под покупкой
+            # на hostinger.com).
+            if (
+                transactions
+                and not DATE_RE.search(line)
+                and not _should_skip(line)
+            ):
+                tail = line.strip()
+                if tail:
+                    transactions[-1].description = (
+                        transactions[-1].description + " " + tail
+                    ).strip()
 
     return transactions

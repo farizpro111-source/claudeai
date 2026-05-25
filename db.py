@@ -1,10 +1,4 @@
-"""SQLite-хранилище транзакций и выученных категорий.
-
-Схема намеренно простая:
-  - transactions: все транзакции, по одной на строку.
-  - merchant_rules: выученные правила (описание -> категория), чтобы при
-    следующей загрузке такие же переводы автоматически попадали туда же.
-"""
+"""SQLite-хранилище: транзакции, выученные правила, пользовательские категории."""
 
 from __future__ import annotations
 
@@ -42,6 +36,11 @@ def init_db() -> None:
                 category        TEXT NOT NULL,
                 created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS user_categories (
+                name            TEXT PRIMARY KEY,
+                created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
@@ -58,7 +57,6 @@ def connect():
 
 
 def insert_transaction(conn, tx, category: str) -> bool:
-    """Возвращает True, если добавили новую строку, False — если был дубль."""
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO transactions
@@ -125,17 +123,18 @@ def category_totals(date_from: str | None = None, date_to: str | None = None) ->
     if date_to:
         query += " AND date <= ?"
         params.append(date_to)
-    query += " GROUP BY category ORDER BY spent DESC"
+    query += " GROUP BY category ORDER BY spent DESC, received DESC"
     with connect() as conn:
         return conn.execute(query, params).fetchall()
 
 
-def upsert_merchant_rule(pattern: str, category: str) -> None:
-    """Запоминаем: «эта подстрока в описании => эта категория».
-    При следующей загрузке такие транзакции попадут сюда автоматически."""
+def upsert_merchant_rule(pattern: str, category: str) -> int:
+    """Сохраняем правило «подстрока → категория» и сразу применяем его ко всем
+    транзакциям, которые юзер ещё не правил руками. Возвращает количество
+    обновлённых транзакций."""
     pattern = pattern.strip().lower()
     if not pattern:
-        return
+        return 0
     with connect() as conn:
         conn.execute(
             """
@@ -144,10 +143,24 @@ def upsert_merchant_rule(pattern: str, category: str) -> None:
             """,
             (pattern, category),
         )
+        # Ретроактивно применяем: все транзакции, описание которых содержит
+        # подстроку И которые ещё не редактировались юзером, переносим
+        # в новую категорию. Исключаем те, которые уже в этой категории,
+        # чтобы счётчик updated был осмысленным.
+        cur = conn.execute(
+            """
+            UPDATE transactions
+            SET category = ?
+            WHERE user_edited = 0
+              AND category != ?
+              AND LOWER(description) LIKE ?
+            """,
+            (category, category, f"%{pattern}%"),
+        )
+        return cur.rowcount
 
 
 def learned_category(description: str) -> str | None:
-    """Возвращает выученную категорию, если её правило подходит к описанию."""
     if not description:
         return None
     desc = description.lower()
@@ -161,3 +174,45 @@ def learned_category(description: str) -> str | None:
 def delete_transaction(tx_id: int) -> None:
     with connect() as conn:
         conn.execute("DELETE FROM transactions WHERE id = ?", (tx_id,))
+
+
+def add_user_category(name: str) -> bool:
+    """Возвращает True, если категория действительно добавлена (а не дубль)."""
+    name = name.strip()
+    if not name:
+        return False
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO user_categories (name) VALUES (?)", (name,)
+        )
+        return cur.rowcount > 0
+
+
+def delete_user_category(name: str) -> None:
+    """Удаляет пользовательскую категорию. Транзакции, висевшие в ней,
+    остаются — их категория тоже стирается до 'Прочее'."""
+    with connect() as conn:
+        conn.execute("DELETE FROM user_categories WHERE name = ?", (name,))
+        conn.execute(
+            "UPDATE transactions SET category = 'Прочее' WHERE category = ?",
+            (name,),
+        )
+
+
+def list_user_categories() -> list[str]:
+    with connect() as conn:
+        return [r["name"] for r in conn.execute(
+            "SELECT name FROM user_categories ORDER BY name"
+        )]
+
+
+def list_merchant_rules() -> list[sqlite3.Row]:
+    with connect() as conn:
+        return conn.execute(
+            "SELECT id, pattern, category FROM merchant_rules ORDER BY pattern"
+        ).fetchall()
+
+
+def delete_merchant_rule(rule_id: int) -> None:
+    with connect() as conn:
+        conn.execute("DELETE FROM merchant_rules WHERE id = ?", (rule_id,))
