@@ -26,8 +26,8 @@ function addMessage(role, text, opts = {}) {
     for (const f of opts.files) {
       const link = document.createElement("a");
       link.className = "file-link";
-      link.href = `/download/${f.file_id}`;
-      link.textContent = `⬇ ${f.filename || f.file_id}`;
+      link.href = `/download/${encodeURIComponent(f.session_id)}/${encodeURIComponent(f.filename)}`;
+      link.textContent = `⬇ ${f.filename}`;
       link.download = f.filename || "";
       wrap.appendChild(link);
     }

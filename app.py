@@ -1,102 +1,117 @@
 import os
+import json
 import uuid
-import mimetypes
-import tempfile
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any
-from io import BytesIO
 
+import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Cookie, Response
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
-from starlette.background import BackgroundTask
 
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
-MODEL = "claude-opus-4-7"
-CODE_EXECUTION_TOOL_TYPE = "code_execution_20250825"
-FILES_BETA = "files-api-2025-04-14"
-CODE_EXEC_BETA = "code-execution-2025-08-25"
+MODEL = "gemini-2.5-flash"
+WORKROOT = Path("/tmp/excel_app_sessions")
+WORKROOT.mkdir(exist_ok=True)
+EXEC_TIMEOUT = 60  # секунд на выполнение скрипта
 
-SYSTEM_PROMPT = """Ты — помощник по Excel. Пользователь описывает задачу на русском, иногда прикладывает Excel-файл (.xlsx, .xls, .csv).
+SYSTEM_PROMPT = """Ты — помощник по Excel. Пользователь пишет задачу по-русски, иногда прикладывает файл (.xlsx, .xls, .csv).
 
-Правила:
-- Если пользователь приложил файл — обязательно запусти Python через инструмент code_execution: открой файл (pandas / openpyxl), посмотри структуру, сделай нужное преобразование, сохрани результат в новый .xlsx в рабочей директории.
-- Используй pandas, openpyxl, xlsxwriter — они уже установлены. Имя итогового файла — короткое и осмысленное (например result.xlsx, отчет.xlsx, sales_pivot.xlsx).
-- После выполнения кода кратко по-русски объясни, что сделал и где смотреть результат. Если заметил проблемы в данных (пустые ячейки, дубликаты, странные типы) — скажи.
-- Если файла нет, а пользователь просит совет / формулу / макрос — ответь текстом, без запуска кода. Давай чёткие шаги и готовые формулы.
-- Будь краток и по делу, без извинений и дисклеймеров."""
+Если файл приложен, тебе показывают его превью (имена листов, столбцы, первые строки) и сообщают путь к нему в рабочей папке. Сам файл ты не видишь — только превью.
+
+Отвечай ВСЕГДА только JSON по схеме:
+{
+  "explanation": "Краткое объяснение по-русски: что ты сделал или какой даёшь совет.",
+  "python_code": "Python-код, который читает входной файл и сохраняет результат. Пустая строка — если код не нужен.",
+  "output_filename": "Имя итогового файла, например result.xlsx. Пустая строка — если нет выходного файла."
+}
+
+Правила для python_code:
+- Доступны: pandas, openpyxl, xlsxwriter, numpy, стандартная библиотека.
+- Текущая директория уже выставлена в рабочую папку. Читай входной файл по относительному пути (имя файла дано в превью).
+- Сохраняй итог в текущую директорию под коротким именем (result.xlsx, отчет.xlsx, pivot.xlsx).
+- НЕ используй input(), sys.argv, сетевые запросы.
+- В конце скрипта напечатай print('OK') — для логов.
+
+Если файла нет, а пользователь просто спрашивает совет / формулу / макрос — дай ответ в "explanation", python_code оставь пустым."""
+
+API_KEY = os.getenv("GEMINI_API_KEY")
+client = genai.Client(api_key=API_KEY) if API_KEY else None
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-client = Anthropic()
-
-# session_id -> {"messages": [...], "container_id": str | None}
+# session_id -> {"workdir": Path, "history": list, "input_file": str | None}
 SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def get_session(session_id: str | None) -> tuple[str, dict[str, Any]]:
     if not session_id or session_id not in SESSIONS:
         session_id = uuid.uuid4().hex
-        SESSIONS[session_id] = {"messages": [], "container_id": None}
+        workdir = WORKROOT / session_id
+        workdir.mkdir(exist_ok=True)
+        SESSIONS[session_id] = {"workdir": workdir, "history": [], "input_file": None}
     return session_id, SESSIONS[session_id]
 
 
-def _attr(obj: Any, key: str, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-def extract_generated_files(content_blocks: list[Any]) -> list[dict[str, str]]:
-    files: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for block in content_blocks:
-        btype = _attr(block, "type")
-        # Result block types from code_execution_20250825 (bash sub-tool)
-        if btype not in ("bash_code_execution_tool_result", "code_execution_tool_result"):
-            continue
-        result = _attr(block, "content")
-        if result is None:
-            continue
-        inner = _attr(result, "content")
-        if not inner:
-            continue
-        for item in inner:
-            fid = _attr(item, "file_id")
-            if fid and fid not in seen:
-                seen.add(fid)
-                files.append({"file_id": fid})
-    return files
-
-
-def extract_text(content_blocks: list[Any]) -> str:
-    out = []
-    for block in content_blocks:
-        if _attr(block, "type") == "text":
-            t = _attr(block, "text", "")
-            if t:
-                out.append(t)
-    return "\n".join(out).strip()
-
-
-def lookup_filename(file_id: str) -> tuple[str, str]:
+def excel_preview(path: Path) -> str:
+    suffix = path.suffix.lower()
     try:
-        meta = client.beta.files.retrieve_metadata(file_id)
-        return (
-            _attr(meta, "filename") or f"{file_id}.xlsx",
-            _attr(meta, "mime_type") or "application/octet-stream",
+        if suffix == ".csv":
+            df = pd.read_csv(path, nrows=20)
+            return (
+                f"CSV. Столбцы: {list(df.columns)}\n"
+                f"Первые строки:\n{df.head(20).to_string()}"
+            )
+        sheets = pd.read_excel(path, sheet_name=None)
+        parts = []
+        for name, df in sheets.items():
+            parts.append(
+                f"=== Лист '{name}' ({len(df)} строк) ===\n"
+                f"Столбцы: {list(df.columns)}\n"
+                f"Первые строки:\n{df.head(15).to_string()}"
+            )
+        return "\n\n".join(parts)
+    except Exception as e:
+        return f"Не удалось прочитать превью: {e}"
+
+
+def execute_python(code: str, workdir: Path) -> tuple[bool, str, str, list[str]]:
+    """Запустить код в workdir. Вернёт (success, stdout, stderr, новые_файлы)."""
+    before = {p.name for p in workdir.iterdir()}
+    script = workdir / "_run.py"
+    script.write_text(code, encoding="utf-8")
+    success = False
+    stdout = stderr = ""
+    try:
+        result = subprocess.run(
+            ["python", str(script)],
+            cwd=str(workdir),
+            capture_output=True,
+            text=True,
+            timeout=EXEC_TIMEOUT,
         )
-    except Exception:
-        return (f"{file_id}.xlsx", "application/octet-stream")
+        stdout = result.stdout
+        stderr = result.stderr
+        success = result.returncode == 0
+    except subprocess.TimeoutExpired:
+        stderr = f"Скрипт работал дольше {EXEC_TIMEOUT}с и был прерван."
+    finally:
+        if script.exists():
+            script.unlink()
+    after = {p.name for p in workdir.iterdir()}
+    new_files = sorted(after - before)
+    return success, stdout, stderr, new_files
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -111,90 +126,107 @@ async def chat(
     file: UploadFile | None = File(None),
     session_id: str | None = Cookie(default=None),
 ):
+    if client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY не задан. Получите бесплатный ключ на https://aistudio.google.com/apikey и впишите в .env",
+        )
     if not message.strip() and file is None:
         raise HTTPException(status_code=400, detail="Пустое сообщение")
 
     sid, session = get_session(session_id)
     response.set_cookie("session_id", sid, httponly=True, samesite="lax")
-
-    user_content: list[dict[str, Any]] = []
+    workdir: Path = session["workdir"]
 
     if file is not None:
         raw = await file.read()
         if not raw:
             raise HTTPException(status_code=400, detail="Файл пуст")
-        mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
-        uploaded = client.beta.files.upload(
-            file=(file.filename or "upload.xlsx", BytesIO(raw), mime),
+        safe_name = Path(file.filename or "input.xlsx").name
+        (workdir / safe_name).write_bytes(raw)
+        session["input_file"] = safe_name
+
+    # Сформировать сообщение пользователю для модели
+    if session["input_file"]:
+        preview = excel_preview(workdir / session["input_file"])
+        user_text = (
+            f"Входной файл: {session['input_file']}\n\n"
+            f"Превью:\n{preview}\n\n"
+            f"Задача: {message or 'Опиши файл и предложи что с ним сделать.'}"
         )
-        user_content.append({"type": "container_upload", "file_id": uploaded.id})
+    else:
+        user_text = message
 
-    user_content.append({"type": "text", "text": message or "Обработай прикреплённый файл."})
-
-    session["messages"].append({"role": "user", "content": user_content})
-
-    create_kwargs: dict[str, Any] = {
-        "model": MODEL,
-        "max_tokens": 8192,
-        "system": SYSTEM_PROMPT,
-        "tools": [{"type": CODE_EXECUTION_TOOL_TYPE, "name": "code_execution"}],
-        "messages": session["messages"],
-        "thinking": {"type": "adaptive"},
-        "betas": [FILES_BETA, CODE_EXEC_BETA],
-    }
-    if session["container_id"]:
-        create_kwargs["container"] = session["container_id"]
+    contents = list(session["history"]) + [
+        {"role": "user", "parts": [{"text": user_text}]}
+    ]
 
     try:
-        with client.beta.messages.stream(**create_kwargs) as stream:
-            final = stream.get_final_message()
+        resp = client.models.generate_content(
+            model=MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
     except Exception as e:
-        session["messages"].pop()
-        raise HTTPException(status_code=500, detail=f"Ошибка API: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка Gemini: {e}")
 
-    container = getattr(final, "container", None)
-    cid = _attr(container, "id")
-    if cid:
-        session["container_id"] = cid
+    raw_text = (resp.text or "").strip()
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError:
+        parsed = {"explanation": raw_text, "python_code": "", "output_filename": ""}
 
-    assistant_blocks = final.content
-    session["messages"].append({"role": "assistant", "content": assistant_blocks})
+    explanation = (parsed.get("explanation") or "").strip() or "(пустой ответ)"
+    code = (parsed.get("python_code") or "").strip()
 
-    text = extract_text(assistant_blocks)
-    generated = extract_generated_files(assistant_blocks)
-    for g in generated:
-        fname, _ = lookup_filename(g["file_id"])
-        g["filename"] = fname
+    session["history"].append({"role": "user", "parts": [{"text": user_text}]})
+    session["history"].append({"role": "model", "parts": [{"text": raw_text}]})
+
+    files_out: list[dict[str, str]] = []
+    exec_log = ""
+    if code:
+        success, stdout, stderr, new_files = execute_python(code, workdir)
+        files_out = [
+            {"filename": f, "session_id": sid}
+            for f in new_files
+            if not f.startswith("_") and f != session.get("input_file")
+        ]
+        if not success:
+            exec_log = f"\n\n⚠️ Ошибка выполнения:\n{stderr[-2000:]}"
+        elif stderr.strip():
+            exec_log = f"\n\n(stderr: {stderr.strip()[-300:]})"
 
     return JSONResponse({
-        "text": text or "(пустой ответ)",
-        "files": generated,
+        "text": explanation + exec_log,
+        "files": files_out,
         "session_id": sid,
     })
 
 
-@app.get("/download/{file_id}")
-def download(file_id: str):
-    try:
-        filename, mime = lookup_filename(file_id)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
-        tmp.close()
-        client.beta.files.download(file_id).write_to_file(tmp.name)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Файл не найден: {e}")
-
-    return FileResponse(
-        tmp.name,
-        media_type=mime,
-        filename=filename,
-        background=BackgroundTask(os.unlink, tmp.name),
-    )
+@app.get("/download/{session_id}/{filename}")
+def download(session_id: str, filename: str):
+    session = SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    safe = Path(filename).name
+    path: Path = session["workdir"] / safe
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return FileResponse(str(path), filename=safe)
 
 
 @app.post("/reset")
 def reset(response: Response, session_id: str | None = Cookie(default=None)):
     if session_id and session_id in SESSIONS:
-        del SESSIONS[session_id]
+        sess = SESSIONS.pop(session_id)
+        try:
+            shutil.rmtree(sess["workdir"])
+        except Exception:
+            pass
     response.delete_cookie("session_id")
     return {"ok": True}
 
