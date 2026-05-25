@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="summary">
+  <form method="get" class="filters">
+    <label>С <input type="date" name="from" value="{{ filters['from'] }}"></label>
+    <label>По <input type="date" name="to" value="{{ filters['to'] }}"></label>
+    <label>Категория
+      <select name="category">
+        <option value="">— все —</option>
+        {% for c in categories %}
+          <option value="{{ c }}" {% if filters['category']==c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Поиск <input type="text" name="q" value="{{ filters['q'] }}" placeholder="по описанию или примечанию"></label>
+    <button type="submit">Применить</button>
+    <a href="{{ url_for('index') }}" class="reset">Сбросить</a>
+  </form>
+
+  <div class="totals">
+    <div class="total total-spent">
+      <span class="label">Потрачено</span>
+      <span class="value">{{ '{:,.0f}'.format(total_spent).replace(',', ' ') }} ₸</span>
+    </div>
+    <div class="total total-received">
+      <span class="label">Получено</span>
+      <span class="value">{{ '{:,.0f}'.format(total_received).replace(',', ' ') }} ₸</span>
+    </div>
+    <div class="total total-net">
+      <span class="label">Чистый</span>
+      <span class="value">{{ '{:,.0f}'.format(total_received - total_spent).replace(',', ' ') }} ₸</span>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="chart-card">
+      <h3>Расходы по категориям</h3>
+      <canvas id="spentChart" height="260"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Приходы по категориям</h3>
+      <canvas id="receivedChart" height="260"></canvas>
+    </div>
+  </div>
+
+  <table class="cats-table">
+    <thead><tr><th>Категория</th><th>Расход</th><th>% расхода</th><th>Доход</th><th>% дохода</th><th>Кол-во</th></tr></thead>
+    <tbody>
+      {% for row in totals %}
+      <tr>
+        <td>
+          <a href="{{ url_for('index', category=row['category'], from=filters['from'], to=filters['to']) }}">
+            {{ row['category'] }}
+          </a>
+        </td>
+        <td class="num">{{ '{:,.0f}'.format(row['spent'] or 0).replace(',', ' ') }} ₸</td>
+        <td class="num">
+          {% if total_spent > 0 %}{{ '%.1f' % ((row['spent'] or 0) * 100 / total_spent) }}%{% else %}—{% endif %}
+        </td>
+        <td class="num">{{ '{:,.0f}'.format(row['received'] or 0).replace(',', ' ') }} ₸</td>
+        <td class="num">
+          {% if total_received > 0 %}{{ '%.1f' % ((row['received'] or 0) * 100 / total_received) }}%{% else %}—{% endif %}
+        </td>
+        <td class="num">{{ row['n'] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="settings">
+  <details>
+    <summary>⚙️ Категории и правила</summary>
+
+    <div class="settings-grid">
+      <div>
+        <h3>Добавить категорию</h3>
+        <form action="{{ url_for('add_category') }}" method="post" class="add-cat-form">
+          <input type="text" name="name" placeholder="Например: Подарки" required>
+          <button type="submit">+ Добавить</button>
+        </form>
+        {% if user_categories %}
+          <h4>Свои категории</h4>
+          <ul class="chip-list">
+            {% for c in user_categories %}
+              <li class="chip">
+                {{ c }}
+                <form action="{{ url_for('delete_category', name=c) }}" method="post"
+                      onsubmit="return confirm('Удалить категорию «{{ c }}»? Её транзакции уйдут в «Прочее».')">
+                  <button class="chip-del" type="submit" title="удалить">×</button>
+                </form>
+              </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </div>
+
+      <div>
+        <h3>Запомненные правила</h3>
+        {% if rules %}
+          <table class="rules-table">
+            <thead><tr><th>Подстрока в описании</th><th>Категория</th><th></th></tr></thead>
+            <tbody>
+              {% for r in rules %}
+              <tr>
+                <td><code>{{ r['pattern'] }}</code></td>
+                <td>{{ r['category'] }}</td>
+                <td>
+                  <form action="{{ url_for('delete_rule', rule_id=r['id']) }}" method="post"
+                        onsubmit="return confirm('Удалить правило?')">
+                    <button type="submit" class="danger small">Удалить</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p class="muted">Пока правил нет. Откройте любую транзакцию, поменяйте категорию
+          и поставьте галочку «запомнить правило» — это правило применится сразу ко всем
+          подходящим транзакциям и ко всем будущим выпискам.</p>
+        {% endif %}
+      </div>
+    </div>
+  </details>
+</section>
+
+<section class="transactions">
+  <h2>Транзакции ({{ transactions|length }})</h2>
+  {% if not transactions %}
+    <p class="empty">Пока ничего нет. Загрузите PDF выписку из Kaspi сверху.</p>
+  {% endif %}
+  {% for tx in transactions %}
+    <details class="tx {% if tx['amount'] < 0 %}tx-out{% else %}tx-in{% endif %} {% if tx['user_edited'] %}tx-edited{% endif %}">
+      <summary>
+        <span class="tx-date">{{ tx['date'] }}</span>
+        <span class="tx-amount">
+          {% if tx['amount'] < 0 %}−{% else %}+{% endif %}{{ '{:,.0f}'.format(tx['amount']|abs).replace(',', ' ') }} ₸
+        </span>
+        <span class="tx-category">{{ tx['category'] }}</span>
+        <span class="tx-desc">{{ tx['description'] or tx['tx_type'] }}</span>
+        {% if tx['note'] %}<span class="tx-note">📝 {{ tx['note'] }}</span>{% endif %}
+      </summary>
+      <form action="{{ url_for('update_tx', tx_id=tx['id']) }}" method="post" class="tx-edit">
+        <label>Категория
+          <select name="category">
+            {% for c in categories %}
+              <option value="{{ c }}" {% if c==tx['category'] %}selected{% endif %}>{{ c }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Примечание
+          <input type="text" name="note" value="{{ tx['note'] }}" placeholder="Например: вернул долг Айдару">
+        </label>
+        <label class="remember">
+          <input type="checkbox" name="remember">
+          запомнить правило для подстроки:
+          <input type="text" name="remember_pattern" placeholder="например: айгерим" value="{{ tx['description'] }}">
+        </label>
+        <div class="actions">
+          <button type="submit">Сохранить</button>
+          <button type="submit" formaction="{{ url_for('delete_tx', tx_id=tx['id']) }}" class="danger"
+                  onclick="return confirm('Удалить транзакцию?')">Удалить</button>
+        </div>
+      </form>
+    </details>
+  {% endfor %}
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const SPENT  = {{ spent_chart_json|safe }};
+  const RECEIVED = {{ received_chart_json|safe }};
+
+  // Палитра — мягкая, не радуга. Циклится для большого числа категорий.
+  const PALETTE = [
+    '#ff5b35', '#ffb347', '#ffd54a', '#7ec97a', '#3fb8af',
+    '#4f8df7', '#7561d6', '#c060c5', '#e25b8c', '#8c8c8c',
+    '#a26f3a', '#4ca374', '#d4a44c', '#5a6f8c', '#a85a5a',
+  ];
+
+  function renderDoughnut(canvasId, data, totalLabel) {
+    const ctx = document.getElementById(canvasId);
+    if (!ctx) return;
+    if (!data.length) {
+      ctx.replaceWith(Object.assign(document.createElement('p'), {
+        textContent: 'Нет данных',
+        className: 'muted',
+      }));
+      return;
+    }
+    const sum = data.reduce((a, b) => a + b.value, 0);
+    new Chart(ctx, {
+      type: 'doughnut',
+      data: {
+        labels: data.map(d => d.category),
+        datasets: [{
+          data: data.map(d => d.value),
+          backgroundColor: data.map((_, i) => PALETTE[i % PALETTE.length]),
+          borderWidth: 1,
+          borderColor: '#fff',
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: '60%',
+        plugins: {
+          legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } },
+          tooltip: {
+            callbacks: {
+              label: (item) => {
+                const v = item.parsed;
+                const pct = sum > 0 ? (v * 100 / sum).toFixed(1) : '0.0';
+                return `${item.label}: ${v.toLocaleString('ru-RU')} ₸ (${pct}%)`;
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  renderDoughnut('spentChart', SPENT);
+  renderDoughnut('receivedChart', RECEIVED);
+</script>
+
+{% endblock %}
